@@ -1,0 +1,5 @@
+
+  "node: $(node -v)"
+  "npm:  $(npm -v)"
+  "docker: $(docker --version)"
+

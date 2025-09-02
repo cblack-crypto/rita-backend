@@ -8,17 +8,21 @@ const logger = pino({ level: config.NODE_ENV === 'production' ? 'info' : 'debug'
 
 export class DatabaseService {
   private redisClient: Redis;
+
   constructor() {
+    // Connect immediately; fail fast if Redis is down.
     this.redisClient = new Redis(config.REDIS_URL, {
-  enableOfflineQueue: false,
-  maxRetriesPerRequest: 3,
-});
-    this.redisClient.on('error', (err) => {
-      logger.error({ err }, 'Redis error');
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 3,
     });
+
+    this.redisClient.on('ready', () => logger.debug('Redis ready'));
+    this.redisClient.on('error', (err) => logger.error({ err }, 'Redis error'));
   }
 
-  get client() { return this.redisClient; }
+  get client() {
+    return this.redisClient;
+  }
 
   async scanKeys(pattern: string, count = 200): Promise<string[]> {
     const keys: string[] = [];
@@ -30,7 +34,6 @@ export class DatabaseService {
     });
   }
 
-  // --- NEW: counts & fetches for FL updates ---
   async countPendingForModel(modelName: string): Promise<number> {
     const pattern = `fl:{${modelName}}:pending:${modelName}:*`;
     const keys = await this.scanKeys(pattern);
@@ -42,12 +45,14 @@ export class DatabaseService {
     const keys = await this.scanKeys(pattern);
     if (keys.length === 0) return [];
     const pipe = this.redisClient.pipeline();
-    keys.forEach(k => pipe.get(k));
+    keys.forEach((k) => pipe.get(k));
     const res = await pipe.exec();
-    return res?.map((r, i) => ({
-      key: keys[i],
-      data: r?.[1] ? JSON.parse(r[1] as string) : null
-    })).filter(x => x.data) ?? [];
+    return (
+      res?.map((r, i) => ({
+        key: keys[i],
+        data: r?.[1] ? JSON.parse(r[1] as string) : null,
+      })).filter((x) => x.data) ?? []
+    );
   }
 
   async markPendingToProcessing(modelName: string): Promise<string[]> {
@@ -56,13 +61,12 @@ export class DatabaseService {
     const pipe = this.redisClient.pipeline();
     for (const { key } of pending) {
       const dest = key.replace(':pending:', ':processing:');
-      pipe.rename(key, dest); // safe because keys share the same hash-tag {modelName}
+      pipe.rename(key, dest);
     }
     await pipe.exec();
-    return pending.map(p => p.key.replace(':pending:', ':processing:'));
+    return pending.map((p) => p.key.replace(':pending:', ':processing:'));
   }
 
-  // --- NEW: simple lock helper using EVAL to safely release ---
   async withLock(lockKey: string, ttlMs: number, fn: () => Promise<void>) {
     const token = crypto.randomUUID();
     const ok = await this.redisClient.set(lockKey, token, 'PX', ttlMs, 'NX');
@@ -82,5 +86,7 @@ export class DatabaseService {
     }
   }
 
-  async close() { await this.redisClient.quit(); }
+  async close() {
+    await this.redisClient.quit();
+  }
 }

@@ -1,3 +1,5 @@
+﻿![Smoke](https://github.com/ORG/REPO/actions/workflows/smoke.yml/badge.svg)
+
 # Rita Backend Starter
 
 Minimal, production-minded scaffold for the Rita AI backend (Fastify + TypeScript) with a Redis dependency and an optional Python simulator.
@@ -26,10 +28,10 @@ curl http://localhost:3000/health
 ```
 
 ## Scripts
-- `pnpm dev` – run with tsx
-- `pnpm build` – transpile to `dist/`
-- `pnpm start` – run built JS
-- `pnpm test` – run Vitest
+- `pnpm dev` â€“ run with tsx
+- `pnpm build` â€“ transpile to `dist/`
+- `pnpm start` â€“ run built JS
+- `pnpm test` â€“ run Vitest
 
 ## Optional Python Simulator
 If you want to generate signed weight uploads from Python:
@@ -57,3 +59,4 @@ tests/
 docker-compose.yml
 Dockerfile
 ```
+

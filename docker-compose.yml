@@ -1,10 +1,15 @@
+﻿version: "3.8"
+
 services:
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "PING"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+    container_name: rita-redis
+    command: ["redis-server","--appendonly","yes","--save","60","1000"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - rita-redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  rita-redis-data:
