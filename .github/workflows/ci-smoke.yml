@@ -1,0 +1,67 @@
+name: CI — smoke
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest   # use Windows so the existing PowerShell + backslashes work
+    timeout-minutes: 15
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Start dev server
+        env:
+          PORT: 3000
+          NODE_ENV: development
+          # talk to the redis service on the runner
+          REDIS_URL: redis://localhost:6379
+          # used by the server to validate signatures
+          DEVICE_HMAC_SECRET: ${{ secrets.DEVICE_HMAC_SECRET }}
+        run: |
+          echo "Starting server..."
+          nohup npm run dev > server.log 2>&1 &
+          echo "Waiting for /health..."
+          for /L %%i in (1,1,60) do (
+            powershell -Command "try { Invoke-RestMethod http://localhost:3000/health | Out-Null; exit 0 } catch { Start-Sleep -Seconds 1 }"
+            if %ERRORLEVEL%==0 goto :ready
+          )
+          echo "Server did not become healthy in time" & type server.log & exit /b 1
+          :ready
+          echo "Server is healthy."
+
+      - name: Run smoke
+        shell: pwsh
+        run: pwsh -File .\scripts\smoke.ps1
+
+      - name: Upload smoke artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rita-proofs
+          path: |
+            docs\proof2\**
+            docs\rita-proofs.zip
+            server.log
