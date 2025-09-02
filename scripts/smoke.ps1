@@ -1,79 +1,85 @@
-﻿Param()
+﻿# scripts/smoke.ps1
+# Minimal, robust smoke for the RITA backend (PowerShell 5+)
 
-cd C:\code\rita-backend
-New-Item -ItemType Directory -Force -Path .\docs\proof2,.\docs\proof3,.\docs\proof4 | Out-Null
+$ErrorActionPreference = 'Stop'
 
-$port = ((Get-Content .env -Raw) -split "`r?`n" | ? {$_ -match '^PORT='} | % {$_ -replace '^PORT=',''})
-if ([string]::IsNullOrWhiteSpace($port)) { $port = 3000 }
-$base = "http://localhost:$port"
-try { Invoke-RestMethod "$base/health" -TimeoutSec 3 | Out-Null } catch { Write-Host "Server not reachable at $base/health" -ForegroundColor Red; exit 1 }
-
-$secret = ((Get-Content .env -Raw) -split "`r?`n" | ? { $_ -match '^DEVICE_HMAC_SECRET=' } | select -First 1) -replace '^DEVICE_HMAC_SECRET=',''
-if ([string]::IsNullOrWhiteSpace($secret)) { Write-Host "DEVICE_HMAC_SECRET missing in .env" -ForegroundColor Red; exit 1 }
-$keyBytes = [Text.Encoding]::UTF8.GetBytes($secret)
-$hmac = [System.Security.Cryptography.HMACSHA256]::new($keyBytes)
-
-function Invoke-PostRaw {
-  param([string]$Url, [string]$Body, [hashtable]$Headers)
-  $req=[System.Net.HttpWebRequest]::Create($Url); $req.Method="POST"; $req.ContentType="application/json"
-  foreach($k in $Headers.Keys){ $req.Headers.Add($k,$Headers[$k]) }
-  $bytes=[System.Text.Encoding]::UTF8.GetBytes($Body); $s=$req.GetRequestStream(); $s.Write($bytes,0,$bytes.Length); $s.Close()
-  try{$resp=$req.GetResponse()}catch [System.Net.WebException]{ $resp=$_.Exception.Response }
-  $status=[int]$resp.StatusCode; $r=New-Object IO.StreamReader($resp.GetResponseStream()); $content=$r.ReadToEnd(); $r.Close(); $resp.Close()
-  [pscustomobject]@{ StatusCode=$status; Content=$content }
+function Get-DeviceSecret {
+  # prefer env var; else read from .env
+  if ($env:DEVICE_HMAC_SECRET -and $env:DEVICE_HMAC_SECRET.Trim().Length -gt 0) {
+    return $env:DEVICE_HMAC_SECRET.Trim()
+  }
+  $envPath = Join-Path -Path (Get-Location) -ChildPath ".env"
+  if (Test-Path $envPath) {
+    $line = (Get-Content $envPath) | Where-Object { $_ -match "^DEVICE_HMAC_SECRET=" } | Select-Object -First 1
+    if ($line) { return $line.Split('=')[1].Trim() }
+  }
+  throw "DEVICE_HMAC_SECRET not found in environment or .env"
 }
 
-function Send-Signed {
-  param([string]$siteId,[int]$samples,[double]$q,[double[]]$w)
-  $body=@{ siteId=$siteId; modelName="demo-model"; weights=@{ layer0=$w }; dataSampleCount=$samples; dataQuality=$q;
-           timestamp=[long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); nonce=[guid]::NewGuid().ToString() }
-  $raw=(ConvertTo-Json $body -Compress)
-  $sig=-join($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($raw))|%{$_.ToString('x2')})
-  Invoke-PostRaw -Url "$base/api/v1/fl/weights" -Body $raw -Headers @{ "x-signature"=$sig; "x-dev-user"="dev-simulator" }
+function Get-NowUnix {
+  $utc = (Get-Date).ToUniversalTime()
+  return [int][Math]::Floor(($utc - [datetime]'1970-01-01Z').TotalSeconds)
 }
 
-# ---- Proof #2: upload + replay ----
-$now=[long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); $nonce=[guid]::NewGuid().ToString()
-$body2=@{ siteId="siteA"; modelName="demo-model"; weights=@{ layer0=@(1.1,-0.5,0.2,0.9) }; dataSampleCount=123; dataQuality=0.95; timestamp=$now; nonce=$nonce }
-$raw2=(ConvertTo-Json $body2 -Compress)
-$sig2=-join($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($raw2))|%{$_.ToString('x2')})
-$hdr=@{ "x-signature"=$sig2; "x-dev-user"="dev-simulator" }
-$r1=Invoke-PostRaw "$base/api/v1/fl/weights" $raw2 $hdr
-$r2=Invoke-PostRaw "$base/api/v1/fl/weights" $raw2 $hdr
-$r1.StatusCode|Out-File -Encoding ascii .\docs\proof2\upload-status.txt
-$r2.StatusCode|Out-File -Encoding ascii .\docs\proof2\replay-status.txt
-$r1.Content|Out-File -Encoding utf8 .\docs\proof2\upload-response.json
-$r2.Content|Out-File -Encoding utf8 .\docs\proof2\replay-response.json
-Invoke-RestMethod "$base/health"|ConvertTo-Json -Depth 6|Out-File -Encoding utf8 .\docs\proof2\health.json
-Invoke-RestMethod "$base/api/v1/metrics"|ConvertTo-Json -Depth 6|Out-File -Encoding utf8 .\docs\proof2\metrics.json
+function Compute-HmacSha256([string]$secret, [string]$raw) {
+  $keyBytes = [Text.Encoding]::UTF8.GetBytes($secret)
+  $mac = [System.Security.Cryptography.HMACSHA256]::new($keyBytes)
+  $hash = $mac.ComputeHash([Text.Encoding]::UTF8.GetBytes($raw))
+  -join ($hash | ForEach-Object { $_.ToString('x2') })
+}
 
-# ---- Proof #3: 3 updates + aggregate ----
-$rA=Send-Signed -siteId "siteA" -samples 120 -q 0.96 -w @(1.00,-0.40,0.30,0.80)
-$rB=Send-Signed -siteId "siteB" -samples 150 -q 0.94 -w @(1.20,-0.60,0.10,0.70)
-$rC=Send-Signed -siteId "siteC" -samples 100 -q 0.95 -w @(0.90,-0.50,0.20,0.90)
-$rA.StatusCode|Out-File -Encoding ascii .\docs\proof3\siteA-status.txt
-$rB.StatusCode|Out-File -Encoding ascii .\docs\proof3\siteB-status.txt
-$rC.StatusCode|Out-File -Encoding ascii .\docs\proof3\siteC-status.txt
-$rA.Content|Out-File -Encoding utf8 .\docs\proof3\siteA-response.json
-$rB.Content|Out-File -Encoding utf8 .\docs\proof3\siteB-response.json
-$rC.Content|Out-File -Encoding utf8 .\docs\proof3\siteC-response.json
-$agg=Invoke-PostRaw "$base/api/v1/fl/aggregate-now" '{"modelName":"demo-model"}' @{ "x-dev-user"="dev-simulator" }
-$agg.StatusCode|Out-File -Encoding ascii .\docs\proof3\aggregate-status.txt
-$agg.Content|Out-File -Encoding utf8 .\docs\proof3\aggregate-response.json
-Invoke-RestMethod "$base/health"|ConvertTo-Json -Depth 6|Out-File -Encoding utf8 .\docs\proof3\health.json
-Invoke-RestMethod "$base/api/v1/metrics"|ConvertTo-Json -Depth 6|Out-File -Encoding utf8 .\docs\proof3\metrics.json
+function Invoke-PostJson([string]$url, [string]$raw, [hashtable]$headers) {
+  try {
+    $r = Invoke-WebRequest -Uri $url -Method POST -ContentType 'application/json' -Body $raw -Headers $headers
+    return [pscustomobject]@{ StatusCode = [int]$r.StatusCode; Content = [string]$r.Content }
+  } catch {
+    $resp = $_.Exception.Response
+    if ($resp -ne $null) {
+      $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+      $content = $reader.ReadToEnd()
+      return [pscustomobject]@{ StatusCode = [int]$resp.StatusCode; Content = [string]$content }
+    }
+    throw
+  }
+}
 
-# ---- Proof #4: model latest + summary ----
-$latest=Invoke-RestMethod "$base/api/v1/fl/model/demo-model" -ErrorAction SilentlyContinue
-$latest|ConvertTo-Json -Depth 8|Out-File -Encoding utf8 .\docs\proof4\model-latest.json
-$ver=$null; try{ $ver=(Get-Content .\docs\proof3\aggregate-response.json -Raw|ConvertFrom-Json).version }catch{}
-if($ver){ (Invoke-RestMethod "$base/api/v1/fl/model/demo-model?version=$ver")|ConvertTo-Json -Depth 8|Out-File -Encoding utf8 ".\docs\proof4\model-$ver.json" }
-$hist=$latest.availableVersions
-[pscustomobject]@{ timestamp=(Get-Date).ToString("s"); latestVersion=$latest.version; versions=$hist; participantCount=$latest.participantCount; createdAt=$latest.createdAt } |
-  ConvertTo-Json -Depth 6 | Out-File -Encoding utf8 .\docs\proof4\summary.json
+# ---------- config ----------
+$base = "http://localhost:3000"
+$api  = "$base/api/v1"
+$artifactDir = "docs\proof2"
 
-# ---- zip ----
-if(Test-Path .\docs\rita-proofs.zip){ Remove-Item .\docs\rita-proofs.zip -Force }
-Compress-Archive -Path .\docs\proof* -DestinationPath .\docs\rita-proofs.zip
-Write-Host "upload: $(Get-Content .\docs\proof2\upload-status.txt)  replay: $(Get-Content .\docs\proof2\replay-status.txt)  aggregate: $(Get-Content .\docs\proof3\aggregate-status.txt)"
-Write-Host "Zip -> docs\rita-proofs.zip" -ForegroundColor Green
+# ---------- prepare ----------
+New-Item -ItemType Directory -Force $artifactDir | Out-Null
+$secret = Get-DeviceSecret
+$body = @{ timestamp = Get-NowUnix } | ConvertTo-Json -Compress
+$sig  = Compute-HmacSha256 -secret $secret -raw $body
+$headers = @{ 'x-signature' = $sig; 'x-dev-user' = 'dev-simulator' }
+
+# save request artifacts
+$body      | Out-File -FilePath (Join-Path $artifactDir "request.json")       -Encoding utf8
+$sig       | Out-File -FilePath (Join-Path $artifactDir "request.sig.txt")    -Encoding ascii
+
+# ---------- 1) first POST (expect 200) ----------
+$r1 = Invoke-PostJson -url "$api/fl/weights" -raw $body -headers $headers
+"$($r1.StatusCode)" | Out-File -FilePath (Join-Path $artifactDir "upload-status.txt")  -Encoding ascii
+$r1.Content        | Out-File -FilePath (Join-Path $artifactDir "upload-response.json") -Encoding utf8
+
+# ---------- 2) replay same body (expect 409) ----------
+$r2 = Invoke-PostJson -url "$api/fl/weights" -raw $body -headers $headers
+"$($r2.StatusCode)" | Out-File -FilePath (Join-Path $artifactDir "replay-status.txt")  -Encoding ascii
+$r2.Content        | Out-File -FilePath (Join-Path $artifactDir "replay-response.json") -Encoding utf8
+
+# ---------- 3) health snapshot ----------
+$health = Invoke-RestMethod "$base/health"
+$health | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $artifactDir "health.json") -Encoding utf8
+
+# ---------- 4) zip results ----------
+$zipPath = "docs\rita-proofs.zip"
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+Compress-Archive -Path (Join-Path $artifactDir "*") -DestinationPath $zipPath -Force
+
+# ---------- summary ----------
+Write-Host ""
+Write-Host "=== Smoke Summary ===" -ForegroundColor Cyan
+Write-Host ("upload: {0}   replay: {1}" -f $r1.StatusCode, $r2.StatusCode)
+Write-Host ("zip  -> {0}" -f $zipPath)
